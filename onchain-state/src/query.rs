@@ -56,7 +56,7 @@ pub fn idx<D: DB>(
                 .try_into()
                 .map_err(|_| IdxError::InvalidKey("cannot convert key to tree position".into()))?;
             if pos >= (1u64 << tree.height() as u64) {
-                return Ok(None);
+                return Err(IdxError::MissingKey);
             }
             Ok(tree.index(pos).map(|(hash, ())| {
                 StateValue::Cell(Sp::new(hash.into()))
@@ -89,6 +89,7 @@ pub fn idx_path<D: DB>(
 pub enum IdxError {
     IndexOutOfBounds(u8),
     InvalidKey(String),
+    MissingKey,
     UnsupportedVariant,
 }
 
@@ -97,6 +98,7 @@ impl std::fmt::Display for IdxError {
         match self {
             IdxError::IndexOutOfBounds(i) => write!(f, "index {i} out of bounds"),
             IdxError::InvalidKey(msg) => write!(f, "invalid key: {msg}"),
+            IdxError::MissingKey => write!(f, "key not found"),
             IdxError::UnsupportedVariant => {
                 write!(f, "unsupported variant: only array, map, and merkle tree can be indexed")
             }
