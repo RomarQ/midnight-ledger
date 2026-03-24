@@ -185,8 +185,8 @@ fn idx<D: DB>(
 
     // Navigate first (validates the key), then check cache.
     // This preserves the original behavior: invalid keys error before cache miss.
-    let result = runtime_state::query::idx(&value.0.value, key).map_err(|e| match e {
-        runtime_state::query::IdxError::IndexOutOfBounds(i) => {
+    let result = runtime_state::nav::idx(&value.0.value, key).map_err(|e| match e {
+        runtime_state::nav::IdxError::IndexOutOfBounds(i) => {
             OnchainProgramError::TypeError(format!(
                 "index out of bounds in idx: {} >= {}",
                 i,
@@ -196,19 +196,24 @@ fn idx<D: DB>(
                 }
             ))
         }
-        runtime_state::query::IdxError::UnsupportedVariant => {
+        runtime_state::nav::IdxError::UnsupportedVariant => {
             OnchainProgramError::TypeError(
                 "tried to idx, only map, array, and bmt are supported".to_string(),
             )
         }
-        runtime_state::query::IdxError::InvalidKey(_) => {
-            OnchainProgramError::TypeError(e.to_string())
-        }
-        runtime_state::query::IdxError::MissingKey => OnchainProgramError::MissingKey,
+        runtime_state::nav::IdxError::Decode(e) => OnchainProgramError::Decode(e),
+        runtime_state::nav::IdxError::MissingKey => OnchainProgramError::MissingKey,
     })?;
 
+    // Cache check for Array and Map only — the original MerkleTree path
+    // does not check the cache.
     if cached && cache_miss {
-        return Err(OnchainProgramError::CacheMiss);
+        match &value.0.value {
+            StateValue::Array(_) | StateValue::Map(_) => {
+                return Err(OnchainProgramError::CacheMiss);
+            }
+            _ => {}
+        }
     }
 
     let sv = result.unwrap_or(StateValue::Null);

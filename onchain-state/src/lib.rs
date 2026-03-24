@@ -16,5 +16,5 @@
 // Proptest derive triggers this.
 #![allow(non_local_definitions)]
 
-pub mod query;
+pub mod nav;
 pub mod state;

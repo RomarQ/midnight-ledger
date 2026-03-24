@@ -28,7 +28,6 @@ pub mod contract_state_ext;
 pub mod test_utilities;
 pub mod transcript;
 
-pub use onchain_runtime_state::query;
 pub use onchain_runtime_state::state;
 
 pub use onchain_vm::cost_model;
