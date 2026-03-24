@@ -25,7 +25,7 @@ use storage::db::DB;
 #[derive(Clone, Debug)]
 pub struct StateQuery {
     /// Path of indices through nested `StateValue::Array` nodes.
-    pub path: Vec<u32>,
+    pub path: Vec<u8>,
     /// Optional key bytes for collection lookups. Serialized `AlignedValue`
     /// for Map/Set, position bytes for MerkleTree.
     pub key: Option<Vec<u8>>,
