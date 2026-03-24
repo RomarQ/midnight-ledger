@@ -13,89 +13,125 @@
 
 //! Targeted queries into a contract's state tree.
 //!
-//! Provides navigation helpers and a batch query function that resolve
-//! specific fields/keys without serializing the full DAG.
+//! Navigates the `StateValue` tree following a path of `AlignedValue` keys,
+//! mirroring the VM's `idx` instruction. Each key is interpreted based on the
+//! current node's type: array index, map key, or merkle tree position.
 
+use base_crypto::fab::{AlignedValue, Value};
 use crate::state::StateValue;
 use serialize::Deserializable;
+use storage::arena::Sp;
 use storage::db::DB;
 
 // ---------------------------------------------------------------------------
-// Navigation helpers (generic over D: DB)
+// Navigation — follows the same model as the VM's `idx` instruction
 // ---------------------------------------------------------------------------
 
-/// Error returned by state navigation functions.
-#[derive(Clone, Debug)]
-pub enum NavError {
-    /// The path expected an Array but found a different variant.
-    ExpectedArray,
-    /// The array index is out of bounds.
-    IndexOutOfBounds(u8),
+/// Navigate one level into a `StateValue` using the given key.
+///
+/// The key is interpreted based on the current variant:
+/// - **Array**: key is converted to `u8` index
+/// - **Map**: key is used directly for `HashMap::get`
+/// - **BoundedMerkleTree**: key is converted to `u64` position
+///
+/// Returns `None` for map keys / tree positions that don't exist.
+/// Returns `Err` for type mismatches or out-of-bounds indices.
+pub fn idx<D: DB>(
+    sv: &StateValue<D>,
+    key: &AlignedValue,
+) -> Result<Option<StateValue<D>>, IdxError> {
+    match sv {
+        StateValue::Array(arr) => {
+            let index: u8 = (&**AsRef::<Value>::as_ref(key))
+                .try_into()
+                .map_err(|_| IdxError::InvalidKey("cannot convert key to array index".into()))?;
+            arr.get(index as usize)
+                .cloned()
+                .map(Some)
+                .ok_or(IdxError::IndexOutOfBounds(index))
+        }
+        StateValue::Map(map) => Ok(map.get(key).map(|sp| (*sp).clone())),
+        StateValue::BoundedMerkleTree(tree) => {
+            let pos: u64 = (&**AsRef::<Value>::as_ref(key))
+                .try_into()
+                .map_err(|_| IdxError::InvalidKey("cannot convert key to tree position".into()))?;
+            if pos >= (1u64 << tree.height() as u64) {
+                return Ok(None);
+            }
+            Ok(tree.index(pos).map(|(hash, ())| {
+                StateValue::Cell(Sp::new(hash.into()))
+            }))
+        }
+        _ => Err(IdxError::UnsupportedVariant),
+    }
 }
 
-impl std::fmt::Display for NavError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            NavError::ExpectedArray => write!(f, "expected array"),
-            NavError::IndexOutOfBounds(idx) => write!(f, "index {idx} out of bounds"),
+/// Navigate a full path of keys through a `StateValue` tree.
+///
+/// Each key in the path is applied via [`idx`]. Stops early if a key is not
+/// found (returns `Ok(None)`).
+pub fn idx_path<D: DB>(
+    sv: &StateValue<D>,
+    keys: &[AlignedValue],
+) -> Result<Option<StateValue<D>>, IdxError> {
+    let mut current = sv.clone();
+    for key in keys {
+        match idx(&current, key)? {
+            Some(next) => current = next,
+            None => return Ok(None),
         }
     }
+    Ok(Some(current))
 }
 
-/// Navigate one level into a `StateValue::Array` by index.
-pub fn get_field<D: DB>(sv: &StateValue<D>, index: u8) -> Result<&StateValue<D>, NavError> {
-    match sv {
-        StateValue::Array(arr) => arr
-            .get(index as usize)
-            .ok_or(NavError::IndexOutOfBounds(index)),
-        _ => Err(NavError::ExpectedArray),
-    }
+/// Error from [`idx`] / [`idx_path`] navigation.
+#[derive(Clone, Debug)]
+pub enum IdxError {
+    IndexOutOfBounds(u8),
+    InvalidKey(String),
+    UnsupportedVariant,
 }
 
-/// Navigate multiple levels through nested `StateValue::Array` nodes.
-pub fn get_field_path<'a, D: DB>(
-    sv: &'a StateValue<D>,
-    path: &[u8],
-) -> Result<&'a StateValue<D>, NavError> {
-    let mut current = sv;
-    for &index in path {
-        current = get_field(current, index)?;
+impl std::fmt::Display for IdxError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IdxError::IndexOutOfBounds(i) => write!(f, "index {i} out of bounds"),
+            IdxError::InvalidKey(msg) => write!(f, "invalid key: {msg}"),
+            IdxError::UnsupportedVariant => {
+                write!(f, "unsupported variant: only array, map, and merkle tree can be indexed")
+            }
+        }
     }
-    Ok(current)
 }
 
 // ---------------------------------------------------------------------------
 // Batch query
 // ---------------------------------------------------------------------------
 
-/// A single query targeting a path and optional key.
+/// A query: a path of serialized `AlignedValue` keys through the state tree.
 #[derive(Clone, Debug)]
 pub struct StateQuery {
-    /// Path of indices through nested `StateValue::Array` nodes.
-    pub path: Vec<u8>,
-    /// Optional key bytes for collection lookups. Serialized `AlignedValue`
-    /// for Map/Set, position bytes for MerkleTree.
-    pub key: Option<Vec<u8>>,
+    /// Each element is a serialized `AlignedValue`. Interpreted as array index,
+    /// map key, or merkle tree position depending on the node at each level.
+    pub path: Vec<Vec<u8>>,
 }
 
 /// Result of a single state query.
 #[derive(Clone, Debug)]
 pub struct StateQueryResult {
-    /// The original query.
     pub query: StateQuery,
-    /// Serialized value bytes (tagged format). `None` if not found.
+    /// Serialized value (tagged format). `None` if not found.
     pub value: Option<Vec<u8>>,
-    /// Per-query error message. `None` if successful.
+    /// Error message. `None` if successful.
     pub error: Option<String>,
 }
 
 /// Resolve a list of queries against a contract's root `StateValue`.
 ///
-/// Each query navigates `path` through nested `Array` nodes, then:
-/// - **Map/Set + key**: looks up via `HashMap::get` (O(log n)).
-/// - **Map/Set without key**: error (serializing the full collection is O(n)).
-/// - **Key on non-collection**: error.
-/// - **Everything else**: `tagged_serialize`s the value.
+/// Each query's path is deserialized into `AlignedValue` keys and navigated
+/// via [`idx_path`]. The final value is serialized with `tagged_serialize`.
+/// Collection values (Map, Set, MerkleTree) at the end of the path are not
+/// serialized (would be O(n)); only leaf values (Cell, Null) are returned.
 pub fn query_state<D: DB>(root: &StateValue<D>, queries: &[StateQuery]) -> Vec<StateQueryResult> {
     queries
         .iter()
@@ -111,28 +147,30 @@ pub fn query_state<D: DB>(root: &StateValue<D>, queries: &[StateQuery]) -> Vec<S
                 error: Some(msg),
             };
 
-            let current = match get_field_path(root, &query.path) {
-                Ok(sv) => sv,
-                Err(e) => return err(e.to_string()),
+            // Deserialize path keys
+            let keys: Vec<AlignedValue> = match query
+                .path
+                .iter()
+                .map(|bytes| {
+                    let mut reader: &[u8] = bytes.as_slice();
+                    <AlignedValue as Deserializable>::deserialize(&mut reader, 0)
+                        .map_err(|e| format!("bad key: {e}"))
+                })
+                .collect::<Result<Vec<_>, _>>()
+            {
+                Ok(keys) => keys,
+                Err(e) => return err(e),
             };
 
-            match (&query.key, current) {
-                (Some(key_bytes), StateValue::Map(map)) => {
-                    let mut reader: &[u8] = key_bytes.as_slice();
-                    match <base_crypto::fab::AlignedValue as Deserializable>::deserialize(
-                        &mut reader,
-                        0,
-                    ) {
-                        Ok(key) => match map.get(&key) {
-                            Some(sp) => serialize_sv(&*sp).map_or_else(err, |b| ok(Some(b))),
-                            None => ok(None),
-                        },
-                        Err(e) => err(format!("bad key: {e}")),
+            match idx_path(root, &keys) {
+                Ok(Some(sv)) => match sv {
+                    StateValue::Map(_) | StateValue::BoundedMerkleTree(_) => {
+                        err("path resolves to a collection; provide a deeper path".into())
                     }
-                }
-                (None, StateValue::Map(_)) => err("key required for map fields".into()),
-                (Some(_), _) => err("key provided but field is not a map".into()),
-                (None, val) => serialize_sv(val).map_or_else(err, |b| ok(Some(b))),
+                    val => serialize_sv(&val).map_or_else(err, |b| ok(Some(b))),
+                },
+                Ok(None) => ok(None),
+                Err(e) => err(e.to_string()),
             }
         })
         .collect()
@@ -148,7 +186,6 @@ fn serialize_sv<D: DB>(sv: &StateValue<D>) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base_crypto::fab::AlignedValue;
     use serialize::Serializable;
     use storage::db::InMemoryDB;
     use storage::storage::{Array, HashMap};
@@ -157,116 +194,157 @@ mod tests {
         StateValue::from(val)
     }
 
-    // -- Navigation helper tests --
+    fn serialize_key(val: impl Into<AlignedValue>) -> Vec<u8> {
+        let av: AlignedValue = val.into();
+        let mut bytes = Vec::new();
+        av.serialize(&mut bytes).unwrap();
+        bytes
+    }
+
+    // -- idx tests --
 
     #[test]
-    fn get_field_returns_element() {
-        let root: StateValue<InMemoryDB> =
+    fn idx_array() {
+        let arr: StateValue<InMemoryDB> =
             StateValue::Array(Array::from(vec![make_cell(42), make_cell(100)]));
-        let sv = get_field(&root, 1).unwrap();
-        assert!(matches!(sv, StateValue::Cell(_)));
+        let key: AlignedValue = 1u8.into();
+        let result = idx(&arr, &key).unwrap().unwrap();
+        assert!(matches!(result, StateValue::Cell(_)));
     }
 
     #[test]
-    fn get_field_out_of_bounds() {
-        let root: StateValue<InMemoryDB> =
+    fn idx_array_out_of_bounds() {
+        let arr: StateValue<InMemoryDB> =
             StateValue::Array(Array::from(vec![make_cell(1)]));
-        assert!(matches!(get_field(&root, 5), Err(NavError::IndexOutOfBounds(5))));
+        let key: AlignedValue = 5u8.into();
+        assert!(matches!(idx(&arr, &key), Err(IdxError::IndexOutOfBounds(5))));
     }
 
     #[test]
-    fn get_field_on_non_array() {
-        let root: StateValue<InMemoryDB> = make_cell(1);
-        assert!(matches!(get_field(&root, 0), Err(NavError::ExpectedArray)));
+    fn idx_map_found() {
+        let map_key: AlignedValue = 42u64.into();
+        let mut map = HashMap::<AlignedValue, StateValue<InMemoryDB>, InMemoryDB>::default();
+        map = map.insert(map_key.clone(), make_cell(999));
+        let sv = StateValue::Map(map);
+        let result = idx(&sv, &map_key).unwrap();
+        assert!(result.is_some());
     }
 
     #[test]
-    fn get_field_path_navigates_nested() {
-        let inner = StateValue::Array(Array::from(vec![make_cell(99)]));
-        let root: StateValue<InMemoryDB> = StateValue::Array(Array::from(vec![inner]));
-        let sv = get_field_path(&root, &[0, 0]).unwrap();
-        assert!(matches!(sv, StateValue::Cell(_)));
+    fn idx_map_not_found() {
+        let map = HashMap::<AlignedValue, StateValue<InMemoryDB>, InMemoryDB>::default();
+        let sv = StateValue::Map(map);
+        let key: AlignedValue = 1u64.into();
+        assert!(idx(&sv, &key).unwrap().is_none());
     }
 
-    // -- Query tests --
+    #[test]
+    fn idx_unsupported_variant() {
+        let cell: StateValue<InMemoryDB> = make_cell(1);
+        let key: AlignedValue = 0u8.into();
+        assert!(matches!(idx(&cell, &key), Err(IdxError::UnsupportedVariant)));
+    }
+
+    // -- idx_path tests --
 
     #[test]
-    fn query_cell_value() {
+    fn idx_path_through_array_and_map() {
+        let map_key: AlignedValue = 7u64.into();
+        let mut map = HashMap::<AlignedValue, StateValue<InMemoryDB>, InMemoryDB>::default();
+        map = map.insert(map_key.clone(), make_cell(42));
+        let root: StateValue<InMemoryDB> =
+            StateValue::Array(Array::from(vec![StateValue::Map(map)]));
+
+        let index_key: AlignedValue = 0u8.into();
+        let result = idx_path(&root, &[index_key, map_key]).unwrap().unwrap();
+        assert!(matches!(result, StateValue::Cell(_)));
+    }
+
+    #[test]
+    fn idx_path_stops_on_not_found() {
+        let map = HashMap::<AlignedValue, StateValue<InMemoryDB>, InMemoryDB>::default();
+        let root: StateValue<InMemoryDB> =
+            StateValue::Array(Array::from(vec![StateValue::Map(map)]));
+
+        let index_key: AlignedValue = 0u8.into();
+        let missing_key: AlignedValue = 999u64.into();
+        assert!(idx_path(&root, &[index_key, missing_key]).unwrap().is_none());
+    }
+
+    // -- query_state tests --
+
+    #[test]
+    fn query_cell() {
         let root: StateValue<InMemoryDB> =
             StateValue::Array(Array::from(vec![make_cell(42)]));
-        let results = query_state(&root, &[StateQuery { path: vec![0], key: None }]);
+        let results = query_state(&root, &[StateQuery {
+            path: vec![serialize_key(0u8)],
+        }]);
         assert!(results[0].value.is_some());
         assert!(results[0].error.is_none());
     }
 
     #[test]
-    fn query_map_without_key_errors() {
-        let map = HashMap::<AlignedValue, StateValue<InMemoryDB>, InMemoryDB>::default();
-        let root = StateValue::Array(Array::from(vec![StateValue::Map(map)]));
-        let results = query_state(&root, &[StateQuery { path: vec![0], key: None }]);
-        assert!(results[0].error.as_ref().unwrap().contains("key required"));
-    }
-
-    #[test]
-    fn query_map_key_found() {
-        let key_val: AlignedValue = 42u64.into();
-        let mut key_bytes = Vec::new();
-        key_val.serialize(&mut key_bytes).unwrap();
+    fn query_map_entry() {
+        let map_key: AlignedValue = 42u64.into();
         let mut map = HashMap::<AlignedValue, StateValue<InMemoryDB>, InMemoryDB>::default();
-        map = map.insert(key_val, make_cell(999));
-        let root = StateValue::Array(Array::from(vec![StateValue::Map(map)]));
-        let results = query_state(&root, &[StateQuery { path: vec![0], key: Some(key_bytes) }]);
+        map = map.insert(map_key, make_cell(999));
+        let root: StateValue<InMemoryDB> =
+            StateValue::Array(Array::from(vec![StateValue::Map(map)]));
+        let results = query_state(&root, &[StateQuery {
+            path: vec![serialize_key(0u8), serialize_key(42u64)],
+        }]);
         assert!(results[0].value.is_some());
     }
 
     #[test]
-    fn query_map_key_not_found() {
-        let key_val: AlignedValue = 999u64.into();
-        let mut key_bytes = Vec::new();
-        key_val.serialize(&mut key_bytes).unwrap();
+    fn query_map_not_found() {
         let map = HashMap::<AlignedValue, StateValue<InMemoryDB>, InMemoryDB>::default();
-        let root = StateValue::Array(Array::from(vec![StateValue::Map(map)]));
-        let results = query_state(&root, &[StateQuery { path: vec![0], key: Some(key_bytes) }]);
+        let root: StateValue<InMemoryDB> =
+            StateValue::Array(Array::from(vec![StateValue::Map(map)]));
+        let results = query_state(&root, &[StateQuery {
+            path: vec![serialize_key(0u8), serialize_key(999u64)],
+        }]);
         assert!(results[0].value.is_none());
         assert!(results[0].error.is_none());
     }
 
     #[test]
-    fn query_index_out_of_bounds() {
+    fn query_stops_at_collection() {
+        let map = HashMap::<AlignedValue, StateValue<InMemoryDB>, InMemoryDB>::default();
         let root: StateValue<InMemoryDB> =
-            StateValue::Array(Array::from(vec![make_cell(1)]));
-        let results = query_state(&root, &[StateQuery { path: vec![99], key: None }]);
-        assert!(results[0].error.as_ref().unwrap().contains("out of bounds"));
-    }
-
-    #[test]
-    fn query_result_echoes_query() {
-        let root: StateValue<InMemoryDB> =
-            StateValue::Array(Array::from(vec![make_cell(42)]));
-        let results = query_state(&root, &[StateQuery { path: vec![0], key: None }]);
-        assert_eq!(results[0].query.path, vec![0]);
+            StateValue::Array(Array::from(vec![StateValue::Map(map)]));
+        // Path stops at the Map without going deeper
+        let results = query_state(&root, &[StateQuery {
+            path: vec![serialize_key(0u8)],
+        }]);
+        assert!(results[0].error.as_ref().unwrap().contains("collection"));
     }
 
     #[test]
     fn query_batch() {
-        let key_val: AlignedValue = 1u64.into();
-        let mut key_bytes = Vec::new();
-        key_val.serialize(&mut key_bytes).unwrap();
+        let map_key: AlignedValue = 1u64.into();
         let mut map = HashMap::<AlignedValue, StateValue<InMemoryDB>, InMemoryDB>::default();
-        map = map.insert(key_val, make_cell(10));
+        map = map.insert(map_key, make_cell(10));
         let root: StateValue<InMemoryDB> = StateValue::Array(Array::from(vec![
             StateValue::Map(map),
             make_cell(42),
         ]));
-        let results = query_state(
-            &root,
-            &[
-                StateQuery { path: vec![1], key: None },
-                StateQuery { path: vec![0], key: Some(key_bytes) },
-            ],
-        );
+        let results = query_state(&root, &[
+            StateQuery { path: vec![serialize_key(1u8)] },            // cell
+            StateQuery { path: vec![serialize_key(0u8), serialize_key(1u64)] }, // map entry
+        ]);
         assert_eq!(results.len(), 2);
         assert!(results[0].value.is_some());
         assert!(results[1].value.is_some());
+    }
+
+    #[test]
+    fn query_echoes_query() {
+        let root: StateValue<InMemoryDB> =
+            StateValue::Array(Array::from(vec![make_cell(42)]));
+        let path = vec![serialize_key(0u8)];
+        let results = query_state(&root, &[StateQuery { path: path.clone() }]);
+        assert_eq!(results[0].query.path, path);
     }
 }
